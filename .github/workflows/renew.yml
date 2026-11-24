@@ -66,6 +66,8 @@ jobs:
           python -c "import DrissionPage, requests; print('DrissionPage', DrissionPage.__version__)"
 
       - name: 🚀 执行续期
+        env:
+          DEBUG_DOM: ${{ vars.DEBUG_DOM || '0' }}
         run: |
           xvfb-run -a --server-args="-screen 0 1440x900x24" python main.py
 
