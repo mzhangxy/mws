@@ -389,21 +389,24 @@ def has_turnstile(page) -> bool:
     return bool(page.ele(TURNSTILE_IFRAME, timeout=0.2))
 
 
-def solve_turnstile(page, timeout=90) -> bool:
-    """点掉 Turnstile 的交互式复选框。
+def solve_turnstile(page, timeout=75) -> bool:
+    """点掉 Turnstile 的交互式复选框，返回是否已点成功。
 
     实测要点（cloud.m-ws.cc 的 renew 弹窗）：
-      - checkbox 位于 iframe 的 shadow DOM 内，真正可点的是 <label>
-      - 相对 input 的坐标点击无效；label.click() 4 秒内即可通过
+      - checkbox 在 iframe 的 shadow DOM 内，真正可点的是 <label>
+      - 相对 input 的坐标点击无效；label.click() 通常 2~4 秒即通过
       - widget 会重渲染，元素句柄随时失效，必须每轮重新定位
-      - token 不会写进 input 的 value（永远是 None），只能靠 turnstile
-        消失 / renew 请求发出来判断，所以这里只负责点击
+      - 通过后页面可能立即重载，导致 "connection to the page has been
+        disconnected"，这属于成功信号而不是失败
+      - token 不会写进 input 的 value（永远为 None），所以本函数只负责点击，
+        真正的结果由调用方用 renew 响应判定
     """
     log("🛡️ 出现 Turnstile，尝试点击 checkbox...")
     deadline = time.time() + timeout
     clicked = False
 
     while time.time() < deadline:
+        # 页面重载/跳转后 iframe 会消失，代表已通过
         if not has_turnstile(page):
             if clicked:
                 log("✅ Turnstile 已消失")
@@ -418,7 +421,6 @@ def solve_turnstile(page, timeout=90) -> bool:
                 if frame:
                     sr = frame.ele("tag:body").shadow_root
                     if sr:
-                        # 每轮重新查，避免句柄失效
                         label = sr.ele("css:label")
                         if label:
                             label.click()
@@ -431,11 +433,19 @@ def solve_turnstile(page, timeout=90) -> bool:
                                 clicked = True
                                 log("▶ 已点击 main-wrapper（兜底）")
             except Exception as exc:
-                log(f"⚠️ 点击 Turnstile 失败: {str(exc)[:120]}")
+                msg = str(exc)
+                # 页面已经重载：说明点击生效、验证已过
+                if "disconnected" in msg.lower() or "无效" in msg or "失效" in msg:
+                    log("✅ Turnstile 已通过（页面已刷新）")
+                    return True
+                log(f"⚠️ 点击 Turnstile 失败: {msg[:120]}")
         time.sleep(1)
 
-    log("❌ Turnstile 未通过（超时）")
-    return False
+    if clicked:
+        log("⚠️ Turnstile 超时，但已点击过，交由续期响应判定")
+    else:
+        log("❌ Turnstile 未能点击")
+    return clicked
 
 
 # --------------------------------------------------------------------------- #
@@ -526,19 +536,27 @@ def do_renew(page):
         page.listen.stop()
         return False, f"点击失败: {exc}"
 
-    # 处理可能弹出的 Turnstile
-    for i in range(20):
-        time.sleep(1)
-        if has_turnstile(page):
-            solve_turnstile(page)
+    # 处理可能弹出的 Turnstile；一旦 renew 响应到达就立即收工
+    packet = None
+    turnstile_handled = False
+    for _ in range(60):
+        packet = page.listen.wait(count=1, timeout=1)
+        if packet:
             break
+        if not turnstile_handled and has_turnstile(page):
+            turnstile_handled = True
+            solve_turnstile(page)
 
-    packet = page.listen.wait(count=1, timeout=120)
+    if not packet:
+        packet = page.listen.wait(count=1, timeout=60)
     page.listen.stop()
 
     after = read_timer(page)
     log(f"▶ 续期后: {timer_label(after)}")
-    page.get_screenshot(path=".", name="after_renew.png", full_page=True)
+    try:
+        page.get_screenshot(path=".", name="after_renew.png", full_page=True)
+    except Exception:
+        log("⚠️ 续期后截图失败（页面可能正在重载）")
 
     if packet:
         status = int(getattr(packet.response, "status", 0) or 0)
