@@ -94,6 +94,27 @@ def tg_send_photo(path: str, caption: str) -> None:
 # 浏览器
 # --------------------------------------------------------------------------- #
 
+def configure_proxy(co) -> None:
+    """DrissionPage 的 set_proxy 不支持 socks5，改用 Chrome 原生的 --proxy-server。
+
+    setup_proxy.sh 会同时监听 1080(socks5) 和 1081(http)，优先走 http 入站。
+    """
+    proxy = (os.environ.get("PROXY_SERVER") or "").strip()
+    if (os.environ.get("IS_PROXY") or "").lower() != "true" or not proxy:
+        log("▶ 直连（未启用代理）")
+        return
+
+    m = re.match(r"socks5?://([^:/]+):(\d+)", proxy)
+    if m:
+        host = m.group(1)
+        http_proxy = f"http://{host}:1081"
+        co.set_argument(f"--proxy-server={http_proxy}")
+        log(f"▶ 已挂代理: {http_proxy}（由 {proxy} 映射到 http 入站）")
+    else:
+        co.set_argument(f"--proxy-server={proxy}")
+        log(f"▶ 已挂代理: {proxy}")
+
+
 def build_page() -> ChromiumPage:
     co = ChromiumOptions()
     for path in ("/usr/bin/google-chrome", "/usr/bin/google-chrome-stable", "/usr/bin/chromium"):
@@ -111,16 +132,21 @@ def build_page() -> ChromiumPage:
     co.set_argument("--disable-blink-features=AutomationControlled")
     co.set_argument("--disable-features=IsolateOrigins,site-per-process")
 
-    proxy = (os.environ.get("PROXY_SERVER") or "").strip()
-    if (os.environ.get("IS_PROXY") or "").lower() == "true" and proxy:
-        co.set_proxy(proxy)
-        log(f"▶ 已挂代理: {proxy}")
-    else:
-        log("▶ 直连（未启用代理）")
+    configure_proxy(co)
 
     page = ChromiumPage(co)
     page.set.timeouts(base=10, page_load=90, script=30)
     return page
+
+
+def check_egress(page) -> None:
+    """打印出口 IP，代理失效时一眼能看出来。"""
+    try:
+        page.get("https://api.ipify.org/?format=text")
+        ip = (page.ele("tag:body", timeout=5).text or "").strip()
+        log(f"▶ 出口 IP: {ip[:40]}")
+    except Exception as exc:
+        log(f"⚠️ 出口 IP 检测失败: {exc}")
 
 
 def wait_ready(page, seconds=3) -> None:
@@ -194,6 +220,32 @@ def discord_login(page, token: str) -> bool:
     log("▶ 注入 Discord token...")
     page.get("https://discord.com/login")
     wait_ready(page, 2)
+
+    # 页面没加载出来时执行 JS 会报 "localStorage is not defined"，先确认文档就绪
+    ready = False
+    for _ in range(20):
+        try:
+            state = page.run_js("return document.readyState;")
+            origin = page.run_js("return location.origin;")
+            if str(state) == "complete" and "discord.com" in str(origin):
+                ready = True
+                break
+        except Exception:
+            pass
+        time.sleep(1)
+        try:
+            page.refresh()
+        except Exception:
+            pass
+
+    if not ready:
+        log(f"❌ Discord 登录页未加载，URL: {page.url}")
+        try:
+            page.get_screenshot(path=".", name="discord_load_failed.png", full_page=True)
+        except Exception:
+            pass
+        return False
+
     page.run_js("localStorage.setItem('token', JSON.stringify(arguments[0]));", token)
     time.sleep(1)
     page.refresh()
@@ -487,6 +539,7 @@ def main() -> int:
 
     try:
         page = build_page()
+        check_egress(page)
         page.get(SITE)
         wait_ready(page, 3)
 
