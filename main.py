@@ -5,6 +5,7 @@
      -> 等页面提示 -> 从 DOM 读剩余时长 -> 推送 Telegram。
 """
 
+import json
 import os
 import re
 import time
@@ -212,6 +213,36 @@ def timer_label(hours) -> str:
 # 登录（全程页面操作）
 # --------------------------------------------------------------------------- #
 
+def set_local_storage(page, key: str, value: str) -> bool:
+    """通过 CDP 的 DOMStorage 直写 localStorage。
+
+    Discord 的登录页把 Storage API 从页面 JS 上下文里屏蔽了
+    （typeof localStorage === 'undefined'），所以不能在页面里跑
+    localStorage.setItem，必须走 CDP 写存储层。
+    """
+    try:
+        page.run_cdp("DOMStorage.enable")
+        frame_id = page.run_cdp("Page.getFrameTree")["frameTree"]["frame"]["id"]
+        storage_key = page.run_cdp("Storage.getStorageKeyForFrame", frameId=frame_id)["storageKey"]
+        page.run_cdp(
+            "DOMStorage.setDOMStorageItem",
+            storageId={"storageKey": storage_key, "isLocalStorage": True},
+            key=key,
+            value=value,
+        )
+        got = page.run_cdp(
+            "DOMStorage.getDOMStorageItems",
+            storageId={"storageKey": storage_key, "isLocalStorage": True},
+        )
+        entries = got.get("entries") or []
+        ok = any(k == key for k, _ in entries)
+        log(f"▶ localStorage 写入 {key}: {'成功' if ok else '未确认'} (storageKey={storage_key})")
+        return ok
+    except Exception as exc:
+        log(f"⚠️ CDP 写 localStorage 失败: {str(exc)[:200]}")
+        return False
+
+
 def discord_login(page, token: str) -> bool:
     if not token:
         log("❌ 缺少 DISCORD_TOKEN")
@@ -219,37 +250,27 @@ def discord_login(page, token: str) -> bool:
 
     log("▶ 注入 Discord token...")
     page.get("https://discord.com/login")
-    wait_ready(page, 2)
+    wait_ready(page, 3)
 
-    # 页面没加载出来时执行 JS 会报 "localStorage is not defined"，先确认文档就绪
-    ready = False
+    # 确认确实停在 discord.com 上
     for _ in range(20):
         try:
-            state = page.run_js("return document.readyState;")
-            origin = page.run_js("return location.origin;")
-            if str(state) == "complete" and "discord.com" in str(origin):
-                ready = True
+            if "discord.com" in str(page.run_js("return location.origin;")) and \
+               str(page.run_js("return document.readyState;")) == "complete":
                 break
         except Exception:
             pass
         time.sleep(1)
-        try:
-            page.refresh()
-        except Exception:
-            pass
-
-    if not ready:
+    else:
         log(f"❌ Discord 登录页未加载，URL: {page.url}")
-        try:
-            page.get_screenshot(path=".", name="discord_load_failed.png", full_page=True)
-        except Exception:
-            pass
         return False
 
-    page.run_js("localStorage.setItem('token', JSON.stringify(arguments[0]));", token)
-    time.sleep(1)
+    if not set_local_storage(page, "token", json.dumps(token)):
+        log("❌ token 写入失败")
+        return False
+
     page.refresh()
-    wait_ready(page, 2)
+    wait_ready(page, 3)
 
     for _ in range(30):
         time.sleep(1)
