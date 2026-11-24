@@ -434,6 +434,41 @@ def solve_turnstile(page) -> bool:
 # 续期（纯点击）
 # --------------------------------------------------------------------------- #
 
+def dump_dom(page, tag: str) -> None:
+    """DEBUG_DOM=1 时把关键 DOM 结构打到日志，用来校准选择器。"""
+    if os.environ.get("DEBUG_DOM") != "1":
+        return
+    log(f"===== DOM DUMP [{tag}] url={page.url} =====")
+    try:
+        for b in page.eles("tag:button"):
+            try:
+                log(f"  BUTTON {repr((b.text or '').strip()[:40])} "
+                    f"class={(b.attr('class') or '')[:60]}")
+            except Exception:
+                pass
+        for a in page.eles("tag:a"):
+            try:
+                txt = (a.text or "").strip()
+                if txt and len(txt) <= 40:
+                    log(f"  A      {repr(txt)} href={(a.attr('href') or '')[:60]}")
+            except Exception:
+                pass
+        # 含「Bot」的短文本节点，看卡片长什么样
+        for ele in page.eles("tag:div"):
+            try:
+                txt = (ele.text or "").strip()
+                if not txt or len(txt) > 60:
+                    continue
+                cls = (ele.attr("class") or "")
+                if re.search(r"(Bot|ボット|机器人|剩余|残り|续期|延長)", txt):
+                    log(f"  DIV    {repr(txt[:60])} class={cls[:70]}")
+            except Exception:
+                pass
+    except Exception as exc:
+        log(f"  dump 异常: {exc}")
+    log(f"===== DOM DUMP END [{tag}] =====")
+
+
 def locate_renew_button(page):
     """首页找「续期」；找不到就点进 Bot 详情页找。"""
     btn = find_clickable(page, RENEW_BTN, tags=("button",), max_len=24)
@@ -570,6 +605,7 @@ def main() -> int:
         else:
             page.get(SITE)
             wait_ready(page, 5)
+            dump_dom(page, "dash-before-renew")
             ok, detail = do_renew(page)
     except Exception:
         detail = "脚本异常:\n" + traceback.format_exc(limit=4)[-800:]
