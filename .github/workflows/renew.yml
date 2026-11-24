@@ -1,0 +1,75 @@
+name: m-ws renew
+
+on:
+  schedule:
+    # 每 6 天一次。GitHub cron 用 day-of-month 步进表达，实际命中每月 1/7/13/19/25/31 号。
+    - cron: "0 3 */6 * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mws-renew
+  cancel-in-progress: false
+
+jobs:
+  renew:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    env:
+      TZ: Asia/Shanghai
+      DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
+      TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+      TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+
+    steps:
+      - name: ⬇ 拉取代码
+        uses: actions/checkout@v4
+
+      - name: 🐍 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: ⚙ 设置代理 (sing-box)
+        continue-on-error: true
+        env:
+          NODE_LINK: ${{ secrets.NODE_LINK }}
+        run: |
+          bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
+
+      - name: 🌐 安装 Chrome + 字体 + xvfb
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            wget curl unzip xvfb fonts-noto-cjk \
+            libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 \
+            libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 \
+            libgbm1 libpango-1.0-0 libcairo2 || true
+
+          # Ubuntu 24.04 起包名带上 t64 后缀，按版本自适应
+          sudo apt-get install -y -qq libasound2t64 2>/dev/null \
+            || sudo apt-get install -y -qq libasound2 2>/dev/null \
+            || true
+
+          wget -q -O /tmp/chrome.deb \
+            https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+          sudo apt-get install -y -qq /tmp/chrome.deb
+          google-chrome --version
+
+      - name: 📦 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          python -c "import DrissionPage, requests; print('DrissionPage', DrissionPage.__version__)"
+
+      - name: 🚀 执行续期
+        run: |
+          xvfb-run -a --server-args="-screen 0 1440x900x24" python main.py
+
+      - name: 🧹 收尾
+        if: always()
+        run: |
+          pkill -f sing-box || true
