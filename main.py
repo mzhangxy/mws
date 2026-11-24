@@ -19,27 +19,20 @@ Settings.raise_when_ele_not_found = False
 Settings.raise_when_wait_failed = False
 
 SITE = "https://cloud.m-ws.cc"
+DASH = f"{SITE}/dash"   # 工作台；SITE 根路径是营销首页，没有续期按钮
 
 # 站点是三语 UI（ja / zh / en），关键词全部覆盖
 LOGIN_BTN = ("使用 Discord 登录", "Discord でログイン", "Login with Discord")
 AUTH_BTN = ("認可", "授权", "授權", "Authorize", "允许", "允許")
 RENEW_BTN = ("续期", "延長", "Renew")
 
-# 卡片上的按钮是「续期」，详情页是「重置计时器（续期7天）」
-SUCCESS_WORDS = (
-    "已重置计时器", "タイマーをリセットしました",
-    "Timer reset", "timer reset", "已延长", "延長しました",
-)
-FAIL_WORDS = (
-    "计时器重置失败", "タイマーのリセットに失敗しました",
-    "Failed to reset the timer",
-)
-
-# 剩余时长：剩余 6天 23h / 残り 6日 23h / 6d 23h left / 剩余 23h
+# 剩余时长：卡片显示 "Sleep in 165h"；也兼容下面几种写法
 PAT_HOURS = [
+    re.compile(r"Sleep\s*in\s*(\d+)\s*h", re.I),
     re.compile(r"(?:剩余|残り)\s*(\d+)\s*[天日]\s*(\d+)\s*h"),
     re.compile(r"(\d+)d\s*(\d+)h\s*(?:left|残り)"),
     re.compile(r"(?:剩余|残り)\s*(\d+)\s*h"),
+    re.compile(r"Sleep\s*in\s*(\d+)\s*(?:d|日|天)\s*(\d+)?\s*h?", re.I),
 ]
 
 
@@ -186,7 +179,11 @@ def page_has_text(page, words, tags=("button", "a", "div", "p", "span", "h1", "h
 
 
 def read_timer(page):
-    """从页面文本里抓剩余时长，返回小时数；抓不到返回 None。"""
+    """从页面文本里抓剩余时长，返回小时数；抓不到返回 None。
+
+    卡片实际显示的是 "Sleep in 165h"（日文 "Sleep in" 相同），
+    另外也兼容 "剩余 6天 23h" / "残り 6日 23h" / "6d 23h left"。
+    """
     try:
         body = page.ele("tag:body", timeout=1)
         text = body.text if body else ""
@@ -335,12 +332,19 @@ def site_login(page, token: str) -> bool:
     # 登录入口本身就是 <a href="/api/auth/login">，点击它，不直接拼地址
     login_link = find_clickable(page, LOGIN_BTN, tags=("a", "button"), max_len=40)
     if login_link:
+        href = ""
+        try:
+            href = login_link.attr("href") or ""
+        except Exception:
+            pass
         try:
             login_link.click()
             log(f"▶ 已点击登录入口: {(login_link.text or '').strip()[:24]}")
-        except Exception as exc:
-            log(f"⚠️ 点击登录入口失败({exc})，退回直接访问")
-            page.get(f"{SITE}/api/auth/login")
+        except Exception:
+            # React 重渲染会把句柄冲掉，直接走它指向的地址
+            target = href or f"{SITE}/api/auth/login"
+            log(f"▶ 登录入口句柄失效，直接访问 {target}")
+            page.get(target)
     else:
         log("⚠️ 未找到登录入口，直接访问")
         page.get(f"{SITE}/api/auth/login")
@@ -385,49 +389,53 @@ def has_turnstile(page) -> bool:
     return bool(page.ele(TURNSTILE_IFRAME, timeout=0.2))
 
 
-def solve_turnstile(page) -> bool:
+def solve_turnstile(page, timeout=90) -> bool:
+    """点掉 Turnstile 的交互式复选框。
+
+    实测要点（cloud.m-ws.cc 的 renew 弹窗）：
+      - checkbox 位于 iframe 的 shadow DOM 内，真正可点的是 <label>
+      - 相对 input 的坐标点击无效；label.click() 4 秒内即可通过
+      - widget 会重渲染，元素句柄随时失效，必须每轮重新定位
+      - token 不会写进 input 的 value（永远是 None），只能靠 turnstile
+        消失 / renew 请求发出来判断，所以这里只负责点击
+    """
     log("🛡️ 出现 Turnstile，尝试点击 checkbox...")
-    try:
-        target_iframe = page.get_frame(TURNSTILE_IFRAME, timeout=8)
-        if not target_iframe:
-            log("未找到 Turnstile iframe")
-            return False
+    deadline = time.time() + timeout
+    clicked = False
 
-        time.sleep(2)  # 等 shadow DOM 渲染
-
-        clicked = False
-        try:
-            sr = target_iframe.ele("tag:body").shadow_root
-            if sr:
-                target_ele = sr.ele('css:input[type="checkbox"]') or sr.ele("css:div.main-wrapper")
-                if target_ele:
-                    target_ele.click.at(offset_x=10, offset_y=10)
-                    clicked = True
-                    log("▶ 已点击 shadow DOM 内的 checkbox")
-        except Exception as exc:
-            log(f"⚠️ shadow DOM 点击失败: {exc}")
+    while time.time() < deadline:
+        if not has_turnstile(page):
+            if clicked:
+                log("✅ Turnstile 已消失")
+                return True
+            time.sleep(1)
+            continue
 
         if not clicked:
+            time.sleep(2)  # 等 shadow DOM 渲染稳定
             try:
-                target_iframe.frame_ele.click.at(offset_x=25, offset_y=30)
-                clicked = True
-                log("▶ 已点击 iframe 本体（兜底）")
+                frame = page.get_frame(TURNSTILE_IFRAME, timeout=8)
+                if frame:
+                    sr = frame.ele("tag:body").shadow_root
+                    if sr:
+                        # 每轮重新查，避免句柄失效
+                        label = sr.ele("css:label")
+                        if label:
+                            label.click()
+                            clicked = True
+                            log("▶ 已点击 Turnstile label")
+                        else:
+                            box = sr.ele("css:div.main-wrapper")
+                            if box:
+                                box.click.at(offset_x=30, offset_y=32)
+                                clicked = True
+                                log("▶ 已点击 main-wrapper（兜底）")
             except Exception as exc:
-                log(f"⚠️ iframe 兜底点击失败: {exc}")
+                log(f"⚠️ 点击 Turnstile 失败: {str(exc)[:120]}")
+        time.sleep(1)
 
-        for i in range(30):
-            time.sleep(1)
-            resp = page.ele('css:[name="cf-turnstile-response"]')
-            value = getattr(resp, "value", None) if resp else None
-            if value and len(value) > 10:
-                log(f"✅ Turnstile 通过（{i + 1}s）")
-                return True
-
-        log("❌ Turnstile token 等待超时")
-        return False
-    except Exception as exc:
-        log(f"❌ Turnstile 处理异常: {exc}")
-        return False
+    log("❌ Turnstile 未通过（超时）")
+    return False
 
 
 # --------------------------------------------------------------------------- #
@@ -470,56 +478,38 @@ def dump_dom(page, tag: str) -> None:
 
 
 def locate_renew_button(page):
-    """首页找「续期」；找不到就点进 Bot 详情页找。"""
+    """在 /dash 的 Bot 卡片上找「续期」按钮。
+
+    真实结构：<button class="card-module__FrKoNG__btn card-module__FrKoNG__btnGhost">续期</button>
+    """
     btn = find_clickable(page, RENEW_BTN, tags=("button",), max_len=24)
     if btn:
-        log(f"✅ 首页找到按钮: {(btn.text or '').strip()}")
+        log(f"✅ 找到续期按钮: {(btn.text or '').strip()}")
         return btn
 
-    log("▶ 首页没有续期按钮，尝试进入 Bot 详情页...")
-    for ele in page.eles("tag:div"):
+    # 兜底：卡片里的 ghost 按钮
+    for ele in page.eles("css:button[class*='card-module']"):
         try:
             txt = (ele.text or "").strip()
         except Exception:
             continue
-        if not txt or len(txt) > 40:
-            continue
-        if not re.search(r"(Bot|ボット|机器人)", txt):
-            continue
-        try:
-            ele.click()
-        except Exception:
-            continue
-        log(f"▶ 点开 Bot: {txt.splitlines()[0][:24]}")
-        wait_ready(page, 3)
-        btn = find_clickable(page, RENEW_BTN, tags=("button",), max_len=24)
-        if btn:
-            log(f"✅ 详情页找到按钮: {(btn.text or '').strip()}")
-            return btn
-        page.back()
-        wait_ready(page, 2)
+        if any(k in txt for k in RENEW_BTN) or txt == "":
+            # 空文本的是图标按钮，跳过
+            if any(k in txt for k in RENEW_BTN):
+                log(f"✅ 通过 class 找到续期按钮: {txt}")
+                return ele
 
     page.get_screenshot(path=".", name="no_renew_button.png", full_page=True)
     log("❌ 找不到续期按钮")
     return None
 
 
-def wait_outcome(page, before_hours, timeout=90):
-    """等成功提示或时长变化，返回 (状态, 文案)。"""
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if find_clickable(page, FAIL_WORDS, tags=("div", "p", "span", "li"), max_len=120):
-            return "fail", "页面提示：续期失败"
-        if find_clickable(page, SUCCESS_WORDS, tags=("div", "p", "span", "li"), max_len=120):
-            return "ok", "页面提示：续期成功"
-        now = read_timer(page)
-        if now is not None and (before_hours is None or now > before_hours + 1):
-            return "ok", "计时器已增长"
-        time.sleep(1)
-    return "unknown", "未观察到成功提示"
-
-
 def do_renew(page):
+    """点续期 -> 按需过 Turnstile -> 用站点自身发出的 renew 响应确认结果。
+
+    判定只依赖浏览器自己产生的流量（listen 是监听，不发起请求），
+    并用响应的 remaining_hours 作为权威结果。
+    """
     before = read_timer(page)
     log(f"▶ 续期前: {timer_label(before)}")
 
@@ -527,60 +517,62 @@ def do_renew(page):
     if not btn:
         return False, "找不到续期按钮"
 
+    # 只监听页面自己发出的续期请求
+    page.listen.start("renew")
     log("▶ 点击续期...")
     try:
         btn.click()
     except Exception as exc:
+        page.listen.stop()
         return False, f"点击失败: {exc}"
 
-    # 先给 15s：要么直接成功，要么弹 Turnstile
-    status, note = "unknown", ""
-    for _ in range(15):
-        if find_clickable(page, SUCCESS_WORDS, tags=("div", "p", "span", "li"), max_len=120):
-            status, note = "ok", "页面提示：续期成功"
-            break
-        if has_turnstile(page):
-            if not solve_turnstile(page):
-                page.get_screenshot(path=".", name="turnstile_failed.png", full_page=True)
-                return False, "Turnstile 未能通过"
-            note = "Turnstile 已通过"
-            break
-        if read_timer(page) is not None and before is not None and read_timer(page) > before + 1:
-            status, note = "ok", "计时器已增长"
-            break
+    # 处理可能弹出的 Turnstile
+    for i in range(20):
         time.sleep(1)
+        if has_turnstile(page):
+            solve_turnstile(page)
+            break
 
-    if status != "ok":
-        # 过完 Turnstile 后前端应自动重发；没动静就手动再点一次
-        if has_turnstile(page) and not solve_turnstile(page):
-            page.get_screenshot(path=".", name="turnstile_failed.png", full_page=True)
-            return False, "Turnstile 未能通过"
+    packet = page.listen.wait(count=1, timeout=120)
+    page.listen.stop()
 
-        wait_ready(page, 2)
-        status, note2 = wait_outcome(page, before, timeout=60)
-        if status == "unknown":
-            log("⚠️ 未观察到结果，再点一次续期")
-            btn2 = locate_renew_button(page)
-            if btn2:
-                try:
-                    btn2.click()
-                    if has_turnstile(page):
-                        solve_turnstile(page)
-                    status, note2 = wait_outcome(page, before, timeout=90)
-                except Exception as exc:
-                    note2 = f"补点失败: {exc}"
-        note = note2 or note
-
-    wait_ready(page, 2)
     after = read_timer(page)
     log(f"▶ 续期后: {timer_label(after)}")
-
     page.get_screenshot(path=".", name="after_renew.png", full_page=True)
 
-    summary = f"续期前 {timer_label(before)}\n续期后 {timer_label(after)}"
-    if note:
-        summary += f"\n{note}"
-    return status == "ok", summary
+    if packet:
+        status = int(getattr(packet.response, "status", 0) or 0)
+        body = packet.response.body
+        if isinstance(body, str):
+            try:
+                body = json.loads(body or "{}")
+            except Exception:
+                body = {}
+        body = body or {}
+        log(f"▶ renew 响应 {status}: {json.dumps(body, ensure_ascii=False)[:300]}")
+
+        timer = body.get("timer") if isinstance(body, dict) else None
+        if timer:
+            hours = timer.get("remaining_hours")
+            stop_at = timer.get("stop_at", "")
+            detail = (f"续期前 {timer_label(before)}\n"
+                      f"剩余 {hours}h\n到期 {stop_at}")
+            if before is not None and hours is not None and hours < before:
+                return False, detail + "\n（续期后时长反而减少，请确认）"
+            return 200 <= status < 300, detail
+
+        if 200 <= status < 300:
+            return True, f"续期前 {timer_label(before)}\n续期后 {timer_label(after)}"
+        return False, f"renew 返回 HTTP {status}"
+
+    # 没抓到响应：退回 DOM 判定
+    if after is not None and before is not None and after > before:
+        return True, f"续期前 {timer_label(before)}\n续期后 {timer_label(after)}\n（未捕获响应，按计时器增长判定）"
+    if after is not None and after >= 167:
+        return True, f"续期后 {timer_label(after)}\n（计时器已接近满额）"
+
+    page.get_screenshot(path=".", name="renew_no_response.png", full_page=True)
+    return False, f"未捕获续期响应\n续期前 {timer_label(before)}\n续期后 {timer_label(after)}"
 
 
 # --------------------------------------------------------------------------- #
@@ -603,8 +595,10 @@ def main() -> int:
             detail = "登录失败（Discord token 或 OAuth 授权）"
             page.get_screenshot(path=".", name="login_failed.png", full_page=True)
         else:
-            page.get(SITE)
-            wait_ready(page, 5)
+            # 登录后已经在 /dash；确保停在工作台，不要回到营销首页
+            if "/dash" not in page.url:
+                page.get(DASH)
+                wait_ready(page, 5)
             dump_dom(page, "dash-before-renew")
             ok, detail = do_renew(page)
     except Exception:
